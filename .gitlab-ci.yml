@@ -1,0 +1,353 @@
+# This file is part of Adblock Plus <https://adblockplus.org/>,
+# Copyright (C) 2006-present eyeo GmbH
+#
+# Adblock Plus is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 3 as
+# published by the Free Software Foundation.
+#
+# Adblock Plus is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with Adblock Plus.  If not, see <http://www.gnu.org/licenses/>.
+
+---
+
+image: python:2
+
+before_script:
+  - apt-get update -yqq
+  - apt-get install apt-transport-https
+  - curl -sL https://deb.nodesource.com/setup_12.x | bash -
+  - apt-get update -yqq
+  - apt-get install -yqq nodejs
+  # enable unsafe-perm to avoid problems with running npm as root
+  # see adblockplusui#193
+  - export npm_config_unsafe_perm=true
+  - export PATH=$PATH:~/.local/bin
+
+stages:
+  - lint
+  - test
+  - build
+  - pages
+  - webext
+  - uploadxtm
+  - updatextm
+  - downloadxtm
+  - uploadcrowdin
+  - downloadcrowdin
+
+################################################################################
+# Test
+################################################################################
+
+lint:
+  stage: lint
+  script:
+    - npm install
+    - npm run lint
+  except:
+    variables:
+      - $CI_PROJECT_NAME == 'adblockplusui-nightlies'
+
+
+test:
+  stage: test
+  script:
+    - npm install
+    - npm run dist
+    - npm run test
+  except:
+    variables:
+      - $CI_PROJECT_NAME == 'adblockplusui-nightlies'
+
+
+################################################################################
+# Build
+################################################################################
+
+build:
+  stage: build
+  script:
+    # Update dependencies
+    - npm run submodules:update
+    # Include resulting dependencies in debug output
+    - git submodule status
+    # Finally build abp
+    - cd adblockpluschrome
+    - npm install
+    - npx gulp build -t firefox --unhandled-rejections=strict
+    - npx gulp build -t chrome --unhandled-rejections=strict
+    # Attach commit hash to build files
+    - mv adblockpluschrome-*.zip adblockplus-chrome-${CI_COMMIT_SHA:0:8}.zip
+    - mv adblockplusfirefox-*.xpi adblockplus-firefox-${CI_COMMIT_SHA:0:8}.xpi
+  artifacts:
+    paths:
+      - adblockpluschrome/adblockplus-chrome-${CI_COMMIT_SHA:0:8}.zip
+      - adblockpluschrome/adblockplus-firefox-${CI_COMMIT_SHA:0:8}.xpi
+  only:
+    refs:
+      - /^release-[0-9]{4}-[0-9]+(\.-?[0-9]+)?$/
+      - /^dep-\w+-[0-9]{4}-[0-9]+(\.-?[0-9]+)?$/
+      - /^feature-[1-9][0-9]*(|-.+)$/
+  except:
+    variables:
+      - $CI_PROJECT_NAME == 'adblockplusui-nightlies'
+
+build:with-snippets:
+  stage: build
+  script:
+    # Configure SSH as seen in this example:
+    # https://gitlab.com/gitlab-examples/ssh-private-key/-/blob/master/.gitlab-ci.yml
+    - command -v ssh-agent >/dev/null || (apt-get update -y && apt-get install openssh-client -y)
+    - eval $(ssh-agent -s)
+    - ssh-add <(echo "$SNIPPETS_SSH_KEY" | base64 -d)
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - ssh-keyscan gitlab.com >> ~/.ssh/known_hosts
+    - chmod 644 ~/.ssh/known_hosts
+    # Get the snippets libary
+    - npm run submodules:update-with-snippets
+    - git submodule status
+    # Prepare to build
+    - cd adblockpluschrome
+    - npm install
+    # Create the builds
+    - npx gulp build -t firefox --unhandled-rejections=strict
+    - npx gulp build -t chrome --unhandled-rejections=strict
+    # Attach commit hash to build files
+    - mv adblockpluschrome-*.zip adblockplus-chrome-${CI_COMMIT_SHA:0:8}.zip
+    - mv adblockplusfirefox-*.xpi adblockplus-firefox-${CI_COMMIT_SHA:0:8}.xpi
+    # Encrypt the builds
+    - gpg -c --batch --passphrase $SNIPPETS_PASSWORD adblockplus-chrome-*.zip
+    - gpg -c --batch --passphrase $SNIPPETS_PASSWORD adblockplus-firefox-*.xpi
+  artifacts:
+    paths:
+      - adblockpluschrome/adblockplus-*.gpg
+  only:
+    refs:
+      - /^release-[0-9]{4}-[0-9]+(\.-?[0-9]+)?$/
+      - /^dep-\w+-[0-9]{4}-[0-9]+(\.-?[0-9]+)?$/
+  except:
+    variables:
+      - $CI_PROJECT_NAME == 'adblockplusui-nightlies'
+
+pages:
+  stage: pages
+  script:
+    - pip install python-gitlab requests Jinja2==2.10
+    - mkdir -p public
+    - |
+      python -c "import gitlab;
+      import jinja2;
+
+      gitlab = gitlab.Gitlab(
+        url='https://gitlab.com',
+        private_token='$PRIVATE_TOKEN_ABPUI');
+      project = gitlab.projects.get('eyeo/adblockplus/abpui/adblockplusui');
+
+      jobs = [];
+      for pipeline in project.pipelines.list(per_page=100, status='success'):
+          for job in pipeline.jobs.list(all=True):
+              if job.attributes['name'] == 'build':
+                  if job.attributes['commit']:
+                    short_id = job.attributes['commit']['short_id']
+                    created_at = job.attributes['commit']['created_at']
+
+                    jobs.append((
+                      job.id,
+                      job.attributes['web_url'],
+                      job.attributes['ref'],
+                      short_id,
+                      created_at,
+                    ));
+
+      env = jinja2.Environment();
+      template = env.from_string('''<html>
+      <head><title>ABP UI Nightlies</title></head>
+      <body>
+      <h1>ABP UI Nightlies</h1>
+      <p>
+        To install the Firefox version (adblockplus-firefox.xpi) you first need to enable installation of an unsigned extension got to
+        <i>about:config</i> and disable <i>xpinstall.signatures.required</i>, see <a href='https://support.mozilla.org/en-US/kb/add-on-signing-in-firefox?as=u&utm_source=inproduct#w_what-are-my-options-if-i-want-to-use-an-unsigned-add-on-advanced-users'>here</a>.
+      </p>
+      <p>
+        To install the Chrome version (adblockplus-chrome.zip) you need unpack the zip archive somewhere, then go to <i>chrome://extensions/</i> enable <i>Developer mode</i> and then load the unpacked extension from the folder you unpacked it to previously.
+      </p>
+      {%- for id, url, ref, commit, date in jobs %}
+      <p>
+          Job: <a href='{{ url }}'>{{ id }}</a>
+          Ref: <a href='https://gitlab.com/eyeo/adblockplus/abpui/adblockplusui/commit/{{ commit }}'>{{ ref }} ({{ commit }})</a>
+          Date: {{ date }}
+          Extension: <a href='https://gitlab.com/api/v4/projects/eyeo%2fadblockplus%2fabpui%2fadblockplusui/jobs/{{ id }}/artifacts/adblockpluschrome/adblockplus-firefox-{{ commit }}.xpi'>adblockplus-firefox-{{ commit }}.xpi</a> / <a href='https://gitlab.com/api/v4/projects/eyeo%2fadblockplus%2fabpui%2fadblockplusui/jobs/{{ id }}/artifacts/adblockpluschrome/adblockplus-chrome-{{ commit }}.zip'>adblockplus-chrome-{{ commit }}.zip (Chrome)</a>
+      </p>
+      {%- endfor %}
+      </body>
+      </html>
+      ''');
+
+      with open('public/index.html', 'w+') as out:
+          out.write(template.render(jobs=jobs));"
+  artifacts:
+    paths:
+      - public/
+  only:
+    refs:
+      - /^release-[0-9]{4}-[0-9]+(\.-?[0-9]+)?$/
+      - /^dep-\w+-[0-9]{4}-[0-9]+(\.-?[0-9]+)?$/
+      - /^feature-[1-9][0-9]*(|-.+)$/
+    variables:
+      - $CI_PROJECT_NAME == 'adblockplusui-nightlies'
+
+################################################################################
+# Translate
+################################################################################
+
+.translations:
+  only: 
+    refs:
+      - /^release-[0-9]{4}-[0-9]+(\.-?[0-9]+)?$/
+
+.crowdin:
+  variables:
+    CROWDIN_TOKEN: $CROWDIN_TOKEN
+    CROWDIN_PROJECT_ID: $CROWDIN_PROJECT_ID
+  environment:
+    name: crowdin
+    url: https://crowdin.com/project/adblockplusui
+
+uploadcrowdin:
+  stage: uploadcrowdin
+  extends: 
+    - .crowdin
+    - .translations
+  script:
+    - npm install
+    # installing java
+    - apt-get install openjdk-11-jre -yqq
+    # installing crowdin-cli
+    - wget https://artifacts.crowdin.com/repo/deb/crowdin3.deb -O crowdin.deb
+    - dpkg -i crowdin.deb
+    - crowdin --version
+    # Uploading strings
+    - npm run $ crowdin.upload-strings
+    - npm run $ crowdin.upload-translations
+  when: manual
+
+downloadcrowdin:
+  stage: downloadcrowdin
+  extends: 
+    - .crowdin
+    - .translations
+  script:
+    - npm install
+    # installing java
+    - apt-get install openjdk-11-jre -yqq
+    # installing crowdin-cli
+    - wget https://artifacts.crowdin.com/repo/deb/crowdin3.deb -O crowdin.deb
+    - dpkg -i crowdin.deb
+    - crowdin --version
+    # Download strings
+    - npm run $ crowdin.download-translations
+    # Test translations
+    - npm run $ lint.locale
+    # Configure author for commit
+    - git config user.email "$GITLAB_USER_EMAIL"
+    - git config user.name "$GITLAB_USER_NAME"
+    # Add changes and commit
+    - git add locale
+    - export COMMIT_MSG="Noissue - Downloaded Crowdin translations for $CI_BUILD_REF_NAME"
+    - git commit -m "$COMMIT_MSG"
+    # Push into new branch and create a new merge request
+    - export TARGET_BRANCH="translation-${CI_BUILD_REF_NAME}-crowdin-download"
+    - export PUSH_URL=$(echo $CI_PROJECT_URL | sed "s/:\/\//:\/\/$GITLAB_USER:$GITLAB_TOKEN@/")
+    - 'git push -f -o merge_request.create -o merge_request.target=$CI_BUILD_REF_NAME -o merge_request.remove_source_branch -o merge_request.title="WIP: ${COMMIT_MSG}" $PUSH_URL HEAD:refs/heads/$TARGET_BRANCH'
+  when: manual
+
+.xtm:
+  variables:
+    USER_ID: $XTM_USER_ID
+    CLIENT: $XTM_CLIENT
+    PASSWORD: $XTM_PASSWORD
+  environment:
+    name: xtm/$CI_COMMIT_REF_SLUG
+    url: https://www.xtm-cloud.com
+
+uploadxtm:
+  stage: uploadxtm
+  extends: 
+    - .xtm
+    - .translations
+  script:
+    - npm install
+    # Currently the xtm script determines the branch name using git rev-parse
+    # which doesn't work inside the CI environment because it's using a detached
+    # head (see https://gitlab.com/gitlab-org/gitlab-ce/issues/19421) to make
+    # it work we need to created the corresponding branches
+    - git branch master origin/master
+    - git checkout -B "$CI_BUILD_REF_NAME" "$CI_BUILD_REF"
+    - npm run $ xtm.create
+  when: manual
+
+updatextm:
+  stage: updatextm
+  extends: 
+    - .xtm
+    - .translations
+  script:
+    - npm install
+    # Currently the xtm script determines the branch name using git rev-parse
+    # which doesn't work inside the CI environment because it's using a detached
+    # head (see https://gitlab.com/gitlab-org/gitlab-ce/issues/19421) to make
+    # it work we need to created the corresponding branches
+    - git branch master origin/master
+    - git checkout -B "$CI_BUILD_REF_NAME" "$CI_BUILD_REF"
+    - npm run $ xtm.update
+  when: manual
+
+downloadxtm:
+  stage: downloadxtm
+  extends: 
+    - .xtm
+    - .translations
+  script:
+    - npm install
+    # Currently the xtm script determines the branch name using git rev-parse
+    # which doesn't work inside the CI environment because it's using a detached
+    # head (see https://gitlab.com/gitlab-org/gitlab-ce/issues/19421) to make
+    # it work we need to created the corresponding branches
+    - git branch master origin/master
+    - git checkout -B "$CI_BUILD_REF_NAME" "$CI_BUILD_REF"
+    # Download the translations
+    - npm run $ xtm.download
+    # Test translations
+    - npm run $ lint.locale
+    # Configure author for commit
+    - git config user.email "$GITLAB_USER_EMAIL"
+    - git config user.name "$GITLAB_USER_NAME"
+    # Add changes and commit
+    - git add locale
+    - export COMMIT_MSG="Noissue - Downloaded XTM translations for $CI_BUILD_REF_NAME"
+    - git commit -m "$COMMIT_MSG"
+    # Push into new branch and create a new merge request
+    - export TARGET_BRANCH="translation-${CI_BUILD_REF_NAME}-xtm-download"
+    - export PUSH_URL=$(echo $CI_PROJECT_URL | sed "s/:\/\//:\/\/$GITLAB_USER:$GITLAB_TOKEN@/")
+    - 'git push -f -o merge_request.create -o merge_request.target=$CI_BUILD_REF_NAME -o merge_request.remove_source_branch -o merge_request.title="WIP: ${COMMIT_MSG}" $PUSH_URL HEAD:refs/heads/$TARGET_BRANCH'
+  when: manual
+
+################################################################################
+# Extension
+################################################################################
+
+webext:
+  stage: webext
+  trigger:
+    include: "/adblockpluschrome/.gitlab-ci.yml"
+    strategy: depend
+  except:
+    variables:
+      - $CI_PROJECT_NAME == 'adblockplusui-nightlies'
+  when: manual
